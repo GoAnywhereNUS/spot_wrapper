@@ -1,6 +1,4 @@
-# Copyright (c) 2025 Robotics and AI Institute LLC dba RAI Institute. All rights reserved.
-
-# Copy reference (c) 2024 Boston Dynamics AI Institute LLC. All references reserved.
+# Copyright (c) 2025-2026 Robotics and AI Institute LLC dba RAI Institute. All rights reserved.
 
 import logging
 from time import sleep
@@ -41,10 +39,10 @@ from bosdyn.client.robot_command import (
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.time_sync import TimedOutError
 
-from spot_wrapper.calibration.automatic_camera_calibration_robot import (
+from spot_wrapper.calibration.calibration_helpers import (
     AutomaticCameraCalibrationRobot,
 )
-from spot_wrapper.calibration.calibration_util import (
+from spot_wrapper.calibration.charuco_board_detection import (
     convert_camera_t_viewpoint_to_origin_t_planning_frame,
     est_camera_t_charuco_board_center,
 )
@@ -124,13 +122,13 @@ class SpotInHandCalibration(AutomaticCameraCalibrationRobot):
             calibration["rgb_intrinsic"] = np.asarray(calibration_dict[tag]["intrinsic"][0]["camera_matrix"]).reshape(
                 (3, 3)
             )
-            rgb_to_depth_T = np.array(calibration_dict[tag]["extrinsic"][1][0]["T"]).reshape((3, 1))
-            rgb_to_depth_R = np.array(calibration_dict[tag]["extrinsic"][1][0]["R"]).reshape((3, 3))
+            rgb_to_depth_T = np.array(calibration_dict[tag]["extrinsic"][0][1]["T"]).reshape((3, 1))
+            rgb_to_depth_R = np.array(calibration_dict[tag]["extrinsic"][0][1]["R"]).reshape((3, 3))
             calibration["rgb_to_depth"] = np.vstack(
                 (np.hstack((rgb_to_depth_R, rgb_to_depth_T)), np.array([0, 0, 0, 1]))
             )
-            depth_to_hand_T = np.array(calibration_dict[tag]["extrinsic"][1]["planning_frame"]["T"]).reshape((3, 1))
-            depth_to_hand_R = np.array(calibration_dict[tag]["extrinsic"][1]["planning_frame"]["R"]).reshape((3, 3))
+            depth_to_hand_T = np.array(calibration_dict[tag]["extrinsic"][0]["planning_frame"]["T"]).reshape((3, 1))
+            depth_to_hand_R = np.array(calibration_dict[tag]["extrinsic"][0]["planning_frame"]["R"]).reshape((3, 3))
             calibration["depth_to_hand"] = np.vstack(
                 (np.hstack((depth_to_hand_R, depth_to_hand_T)), np.array([0, 0, 0, 1]))
             )
@@ -157,8 +155,10 @@ class SpotInHandCalibration(AutomaticCameraCalibrationRobot):
         def convert_pinhole_intrinsic_to_proto(intrinsic_matrix: np.ndarray) -> ImageSource.PinholeModel:
             """Converts a 3x3 intrinsic matrix to a PinholeModel protobuf."""
             pinhole_model = ImageSource.PinholeModel()
-            pinhole_model.CameraIntrinsics.focal_length = intrinsic_matrix[0, :1]
-            pinhole_model.CameraIntrinsics.principal_point = (intrinsic_matrix[0, 2], intrinsic_matrix[1, 2])
+            pinhole_model.intrinsics.focal_length.x = float(intrinsic_matrix[0, 0])
+            pinhole_model.intrinsics.focal_length.y = float(intrinsic_matrix[1, 1])
+            pinhole_model.intrinsics.principal_point.x = float(intrinsic_matrix[0, 2])
+            pinhole_model.intrinsics.principal_point.y = float(intrinsic_matrix[1, 2])
             return pinhole_model
 
         hand_t_wr1_pose = get_a_tform_b(
@@ -181,11 +181,17 @@ class SpotInHandCalibration(AutomaticCameraCalibrationRobot):
         rgb_intrinsics = cal["rgb_intrinsic"]
         rgb_t_depth = cal["rgb_to_depth"]
 
-        depth_to_planning = cal["depth_to_hand"] @ hand_t_planning
-        rgb_to_planning = rgb_t_depth @ depth_to_planning
+        # cal["depth_to_hand"] is rgb_M_hand: the hand frame expressed in RGB camera coords.
+        # hand_t_planning is hand_M_wr1 (hand->wr1 transform built above).
+        # rgb_M_wr1 = rgb_M_hand @ hand_M_wr1
+        rgb_M_wr1 = cal["depth_to_hand"] @ hand_t_planning
+        # rgb_t_depth is depth_M_rgb (stereo extrinsic: maps RGB points → depth frame).
+        # depth_M_wr1 = depth_M_rgb @ rgb_M_wr1
+        depth_M_wr1 = rgb_t_depth @ rgb_M_wr1
 
-        planning_t_depth = np.linalg.inv(depth_to_planning)
-        planning_t_rgb = np.linalg.inv(rgb_to_planning)
+        # API wants wr1_tform_sensor = wr1_M_sensor for each camera
+        planning_t_rgb = np.linalg.inv(rgb_M_wr1)  # wr1_M_rgb → color.wr1_tform_sensor
+        planning_t_depth = np.linalg.inv(depth_M_wr1)  # wr1_M_depth → depth.wr1_tform_sensor
 
         # Converting calibration data to protobuf format
         depth_intrinsics_proto = convert_pinhole_intrinsic_to_proto(depth_intrinsics)
@@ -211,18 +217,25 @@ class SpotInHandCalibration(AutomaticCameraCalibrationRobot):
                 ),
             )
         )
+        logger.info(f" Request to send: \n{set_req}\n")
         # Send the request to the robot
         try:
             result = self.gripper_camera_client.set_camera_calib(set_req)
-            logger.info(f" Set Parameters: \n{result}")
+            logger.info(f" Set Parameters: \n{result}\n")
         except Exception as e:
             raise ValueError(f"Failed to set calibration parameters on the robot: {e}")
 
-        # Optionally, verify by retrieving the parameters back with the following lines
-        # get_req = gripper_camera_param_pb2.GripperCameraGetParamRequest()
-        # cal = self.gripper_camera_client.get_camera_calib(get_req)
-        # logger.info(f"Post-Set Cal (get cam param req): \n {cal}")
+        # Optionally, verify by retrieving the parameters back with the following line
+        # self.get_calibration_from_robot()
         logger.info("Calibration parameters successfully sent to the robot.")
+
+    def get_calibration_from_robot(self) -> None:
+        """Utility function to retrieve and print the current gripper camera calibration
+        from the robot for verification.
+        """
+        get_req = gripper_camera_param_pb2.GripperCameraGetParamRequest()
+        cal = self.gripper_camera_client.get_camera_calib(get_req)
+        logger.info(f"Retrieved calibration from robot: \n{cal}\n")
 
     def capture_images(
         self,
@@ -236,7 +249,7 @@ class SpotInHandCalibration(AutomaticCameraCalibrationRobot):
         if image_responses:
             if len(encodings) != len(image_responses):
                 raise ValueError("Need to specify an encoding for each image request")
-            for idx, (response, encoding) in enumerate(zip(image_responses, encodings)):
+            for response, encoding in zip(image_responses, encodings):
                 image_data = response.shot.image.data
                 image_data = np.frombuffer(image_data, np.uint8)
                 image_data = cv2.imdecode(image_data, encoding)
