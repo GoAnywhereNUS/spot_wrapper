@@ -1493,6 +1493,15 @@ class SpotWrapper:
             manipulation_api_feedback_request=feedback_request
         )
 
+    def get_robot_state(self, frame1, frame2):
+        """
+        Returns SE3 transform from frame1 to frame2 
+        """
+        robot_state = self._robot_state_client.get_robot_state()
+        f1_T_f2 = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot, frame1, frame2)
+        return f1_T_f2
+        
+
     def toggle_power(self, should_power_on):
         """Power the robot on/off dependent on the current power state."""
         is_powered_on = self.check_is_powered_on()

@@ -12,7 +12,12 @@ from bosdyn.api import (
     trajectory_pb2,
 )
 from bosdyn.api.robot_state_pb2 import ManipulatorState
+from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
+from bosdyn.client.frame_helpers import (
+    ODOM_FRAME_NAME
+)
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
+from bosdyn.client.math_helpers import Quat, SE3Pose
 from bosdyn.client.robot import Robot
 from bosdyn.client.robot_command import (
     RobotCommandBuilder,
@@ -147,6 +152,11 @@ class SpotArm:
 
         """
         block_until_arm_arrives(self._robot_command_client, cmd_id=cmd_id, timeout_sec=timeout_sec)
+
+    def get_arm_command_feedback(self, cmd_id):
+        feedback_resp = self._robot_command_client.robot_command_feedback(cmd_id)
+        arm_feedback = feedback_resp.feedback.synchronized_feedback.arm_command_feedback
+        return arm_feedback
 
     def arm_stow(self) -> typing.Tuple[bool, str]:
         """
@@ -347,6 +357,56 @@ class SpotArm:
             return False, f"Exception occured during arm movement: {e}"
 
         return True, "Moved arm successfully"
+
+    def make_pose_trajectory_impedance_command(
+        self, 
+        trajectory,
+        odom_to_task_frame,
+        task_to_tool_frame,
+        impedance_stiffness_diagonal = [500, 500, 500, 60, 60, 60], # Set fairly stiff, should be slightly less stiff than position control
+        impedance_damping_diagonal = [2.5, 2.5, 2.5, 1.0, 1.0, 1.0],
+        blocking=False,
+    ):
+        # Build a stand command to send along with the arm trajectory command, to keep adjusting the body for the arm
+        body_control = spot_command_pb2.BodyControlParams(
+            body_assist_for_manipulation=spot_command_pb2.BodyControlParams.
+            BodyAssistForManipulation(enable_hip_height_assist=False, enable_body_yaw_assist=False))
+        stand_command = RobotCommandBuilder.synchro_stand_command(
+            params=spot_command_pb2.MobilityParams(body_control=body_control))
+
+        robot_cmd = robot_command_pb2.RobotCommand()
+        robot_cmd.CopyFrom(stand_command)  # Adjust body for the arm
+        impedance_cmd = robot_cmd.synchronized_command.arm_command.arm_impedance_command
+
+        impedance_cmd.root_frame_name = ODOM_FRAME_NAME
+        impedance_cmd.root_tform_task.CopyFrom(odom_to_task_frame.to_proto())
+        impedance_cmd.wrist_tform_tool.CopyFrom(task_to_tool_frame.to_proto())
+
+        # Set up stiffness and damping matrices. Note: if these values are set too high,
+        # the arm can become unstable. Currently, these are the max stiffness and
+        # damping values that can be set.
+        impedance_cmd.diagonal_stiffness_matrix.CopyFrom(
+            geometry_pb2.Vector(values=impedance_stiffness_diagonal))
+        impedance_cmd.diagonal_damping_matrix.CopyFrom(
+            geometry_pb2.Vector(values=impedance_damping_diagonal))
+
+        if len(trajectory) > 0:
+            traj = impedance_cmd.task_tform_desired_tool
+            for pos, quat, duration in trajectory:
+                x, y, z = pos
+                qw, qx, qy, qz = quat
+                pt = traj.points.add()
+                pt.time_since_reference.CopyFrom(seconds_to_duration(duration))
+                pt.pose.CopyFrom(SE3Pose(x, y, z, Quat(qw, qx, qy, qz)).to_proto())
+
+            cmd_id = self._robot_command_client.robot_command(robot_cmd)
+            self._logger.info("Pose trajectory with impedance command sent")
+
+            if blocking:
+                self.wait_for_arm_command_to_complete(cmd_id)
+                return None
+            else:
+                return cmd_id
 
     def gripper_open(self) -> typing.Tuple[bool, str]:
         """
